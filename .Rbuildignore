@@ -3,5 +3,3 @@
 ^/tmp$
 ^tmp
 ^/windows$
-.travis.yml
-^.vscode$

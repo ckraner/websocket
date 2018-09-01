@@ -30,7 +30,6 @@ using namespace Rcpp;
 // used. If so, ws_websocketpp::lib::shared_ptr is a std::shared_ptr. If not,
 // ws_websocketpp::lib::shared_ptr is a boost::shared_ptr.
 using ws_websocketpp::lib::shared_ptr;
-using ws_websocketpp::lib::weak_ptr;
 using ws_websocketpp::lib::make_shared;
 
 using ws_websocketpp::lib::placeholders::_1;
@@ -48,7 +47,7 @@ static context_ptr on_tls_init() {
       asio::ssl::context::no_sslv3 |
       asio::ssl::context::single_dh_use);
   } catch (std::exception &e) {
-    Rcpp::Rcout << "Error in context pointer: " << e.what() << std::endl;
+    std::cout << "Error in context pointer: " << e.what() << std::endl;
   }
   return ctx;
 }
@@ -56,22 +55,11 @@ static context_ptr on_tls_init() {
 
 class WSConnection {
 public:
-  WSConnection(shared_ptr<Client> client, Rcpp::Environment robjPublic, Rcpp::Environment robjPrivate) :
-  client(client), robjPublic(robjPublic), robjPrivate(robjPrivate) {}
+  WSConnection(shared_ptr<Client> client) : client(client) {};
 
-  enum STATE { INIT, OPEN, CLOSING, CLOSED, FAILED };
+  enum STATE { INIT, OPEN, CLOSED, FAILED };
   STATE state = INIT;
   shared_ptr<Client> client;
-
-  Rcpp::Environment robjPublic;
-  Rcpp::Environment robjPrivate;
-
-  Rcpp::Function getInvoker(std::string name) {
-    Rcpp::Function gi = robjPrivate.get("getInvoker");
-    return gi(name);
-  }
-
-  bool closeOnOpen = false;
 };
 
 
@@ -87,87 +75,42 @@ void client_deleter(SEXP client_xptr) {
   R_ClearExternalPtr(client_xptr);
 }
 
-void handleMessage(weak_ptr<WSConnection> wsPtrWeak, ws_websocketpp::connection_hdl, message_ptr msg) {
-  shared_ptr<WSConnection> wsPtr = wsPtrWeak.lock();
-  if (wsPtr) {
-    ws_websocketpp::frame::opcode::value opcode = msg->get_opcode();
-    Rcpp::List event;
-    event["target"] = wsPtr->robjPublic;
-    if (opcode == ws_websocketpp::frame::opcode::value::text) {
-      event["data"] = msg->get_payload();
+void handleMessage(Rcpp::Function onMessage, ws_websocketpp::connection_hdl, message_ptr msg) {
+  ws_websocketpp::frame::opcode::value opcode = msg->get_opcode();
+  if (opcode == ws_websocketpp::frame::opcode::value::text) {
+    onMessage(msg->get_payload());
 
-    } else if (opcode == ws_websocketpp::frame::opcode::value::binary) {
-      const std::string msg_str = msg->get_payload();
-      event["data"] = std::vector<uint8_t>(msg_str.begin(), msg_str.end());
+  } else if (opcode == ws_websocketpp::frame::opcode::value::binary) {
+    const std::string msg_str = msg->get_payload();
+    onMessage(std::vector<uint8_t>(msg_str.begin(), msg_str.end()));
 
-    } else {
-      stop("Unknown opcode for message (not text or binary).");
-    }
-
-    wsPtr->getInvoker("message")(event);
+  } else {
+    stop("Unknown opcode for message (not text or binary).");
   }
 }
 
-void removeHandlers(shared_ptr<WSConnection> wsPtr) {
-  wsPtr->robjPublic = Rcpp::Environment();
-  wsPtr->robjPrivate = Rcpp::Environment();
+void handleClose(shared_ptr<WSConnection> wsPtr, Rcpp::Function onClose, ws_websocketpp::connection_hdl) {
+  wsPtr->state = WSConnection::STATE::CLOSED;
+  onClose();
 }
 
-void handleClose(weak_ptr<WSConnection> wsPtrWeak, ws_websocketpp::connection_hdl) {
-  shared_ptr<WSConnection> wsPtr = wsPtrWeak.lock();
-  if (wsPtr) {
-    wsPtr->state = WSConnection::STATE::CLOSED;
-    Rcpp::Function onClose = wsPtr->getInvoker("close");
-    ws_websocketpp::close::status::value code = wsPtr->client->get_remote_close_code();
-    std::string reason = wsPtr->client->get_remote_close_reason();
-    Rcpp::List event;
-    event["target"] = wsPtr->robjPublic;
-    event["code"] = code;
-    event["reason"] = reason;
-
-    removeHandlers(wsPtr);
-    onClose(event);
-  }
+void handleOpen(shared_ptr<WSConnection> wsPtr, Rcpp::Function onOpen, ws_websocketpp::connection_hdl) {
+  wsPtr->state = WSConnection::STATE::OPEN;
+  onOpen();
 }
 
-void handleOpen(weak_ptr<WSConnection> wsPtrWeak, ws_websocketpp::connection_hdl) {
-  shared_ptr<WSConnection> wsPtr = wsPtrWeak.lock();
-  if (wsPtr) {
-    if (wsPtr->closeOnOpen) {
-      wsPtr->state = WSConnection::STATE::CLOSING;
-      wsPtr->client->close(ws_websocketpp::close::status::normal, "");
-      return;
-    }
-
-    wsPtr->state = WSConnection::STATE::OPEN;
-    Rcpp::List event;
-    event["target"] = wsPtr->robjPublic;
-    wsPtr->getInvoker("open")(event);
-  }
-}
-
-void handleFail(weak_ptr<WSConnection> wsPtrWeak, ws_websocketpp::connection_hdl) {
-  shared_ptr<WSConnection> wsPtr = wsPtrWeak.lock();
-  if (wsPtr) {
-    wsPtr->state = WSConnection::STATE::FAILED;
-    Rcpp::Function onFail = wsPtr->getInvoker("error");
-    ws_websocketpp::lib::error_code ec = wsPtr->client->get_ec();
-    std::string errMessage = ec.message();
-
-    Rcpp::List event;
-    event["target"] = wsPtr->robjPublic;
-    event["message"] = errMessage;
-
-    removeHandlers(wsPtr);
-    onFail(event);
-  }
+void handleFail(shared_ptr<WSConnection> wsPtr, Rcpp::Function onFail, ws_websocketpp::connection_hdl) {
+  wsPtr->state = WSConnection::STATE::FAILED;
+  onFail();
 }
 
 // [[Rcpp::export]]
 SEXP wsCreate(
   std::string uri,
-  Rcpp::Environment robjPublic,
-  Rcpp::Environment robjPrivate,
+  Rcpp::Function onMessage,
+  Rcpp::Function onOpen,
+  Rcpp::Function onClose,
+  Rcpp::Function onFail,
   Rcpp::CharacterVector accessLogChannels,
   Rcpp::CharacterVector errorLogChannels
 ) {
@@ -179,26 +122,24 @@ SEXP wsCreate(
 
   if (uri.substr(0, 5) == "ws://") {
     shared_ptr<ClientImpl<ws_client>> client = make_shared<ClientImpl<ws_client>>();
-    wsPtr = make_shared<WSConnection>(client, robjPublic, robjPrivate);
+    wsPtr = make_shared<WSConnection>(client);
 
   } else if (uri.substr(0, 6) == "wss://") {
     shared_ptr<ClientImpl<wss_client>> client = make_shared<ClientImpl<wss_client>>();
-    wsPtr = make_shared<WSConnection>(client, robjPublic, robjPrivate);
+    wsPtr = make_shared<WSConnection>(client);
     wsPtr->client->set_tls_init_handler(bind(&on_tls_init));
 
   } else {
     throw Rcpp::exception("Invalid websocket URI: must begin with ws:// or wss://");
   }
 
-  weak_ptr<WSConnection> wsPtrWeak(wsPtr);
-
   wsPtr->client->update_log_channels("access", "set", accessLogChannels);
   wsPtr->client->update_log_channels("error", "set", errorLogChannels);
   wsPtr->client->init_asio();
-  wsPtr->client->set_open_handler(bind(handleOpen, wsPtrWeak, ::_1));
-  wsPtr->client->set_message_handler(bind(handleMessage, wsPtrWeak, ::_1, ::_2));
-  wsPtr->client->set_close_handler(bind(handleClose, wsPtrWeak, ::_1));
-  wsPtr->client->set_fail_handler(bind(handleFail, wsPtrWeak, ::_1));
+  wsPtr->client->set_open_handler(bind(handleOpen, wsPtr, onOpen, ::_1));
+  wsPtr->client->set_message_handler(bind(handleMessage, onMessage, ::_1, ::_2));
+  wsPtr->client->set_close_handler(bind(handleClose, wsPtr, onClose, ::_1));
+  wsPtr->client->set_fail_handler(bind(handleFail, wsPtr, onFail, ::_1));
 
   ws_websocketpp::lib::error_code ec;
   wsPtr->client->setup_connection(uri, ec);
@@ -221,20 +162,15 @@ void wsAppendHeader(SEXP client_xptr, std::string key, std::string value) {
 }
 
 // [[Rcpp::export]]
-void wsAddProtocols(SEXP client_xptr, CharacterVector protocols) {
-  shared_ptr<WSConnection> wsPtr = xptrGetClient(client_xptr);
-  for (Rcpp::CharacterVector::iterator it = protocols.begin();
-       it != protocols.end();
-       it++) {
-    std::string protocol = Rcpp::as<std::string>(*it);
-    wsPtr->client->add_subprotocol(protocol);
-  }
-}
-
-// [[Rcpp::export]]
 void wsConnect(SEXP client_xptr) {
   shared_ptr<WSConnection> wsPtr = xptrGetClient(client_xptr);
   wsPtr->client->connect();
+  // Block until the connection is either open, closed, or the attempt to connect has failed.
+  // wsPtr->client->run() would block indefinitely, so we use run_one() instead.
+  // We don't need to call restart() here because the underlying io_context is never out of work between invocations.
+  while (wsPtr->state == WSConnection::STATE::INIT) {
+    wsPtr->client->run_one();
+  }
 }
 
 // [[Rcpp::export]]
@@ -263,6 +199,7 @@ void wsSend(SEXP client_xptr, SEXP msg) {
 
   } else if (TYPEOF(msg) == RAWSXP) {
     wsPtr->client->send(RAW(msg), Rf_length(msg), ws_websocketpp::frame::opcode::binary);
+
   } else {
     stop("msg must be a one-element character vector or a raw vector.");
   }
@@ -275,23 +212,9 @@ void wsReset(SEXP client_xptr) {
 }
 
 // [[Rcpp::export]]
-void wsClose(SEXP client_xptr, uint16_t code, std::string reason) {
+void wsClose(SEXP client_xptr) {
   shared_ptr<WSConnection> wsPtr = xptrGetClient(client_xptr);
-
-  switch (wsPtr->state) {
-  case WSConnection::STATE::INIT:
-    wsPtr->closeOnOpen = true;
-    return;
-  case WSConnection::STATE::OPEN:
-    break;
-  case WSConnection::STATE::CLOSING:
-  case WSConnection::STATE::CLOSED:
-  case WSConnection::STATE::FAILED:
-    return;
-  }
-
-  wsPtr->state = WSConnection::STATE::CLOSING;
-  wsPtr->client->close(code, reason);
+  wsPtr->client->close(ws_websocketpp::close::status::normal, "closing normally");
 }
 
 // [[Rcpp::export]]
@@ -301,18 +224,11 @@ bool wsStopped(SEXP client_xptr) {
 }
 
 // [[Rcpp::export]]
-std::string wsProtocol(SEXP client_xptr) {
-  shared_ptr<WSConnection> wsPtr = xptrGetClient(client_xptr);
-  return wsPtr->client->get_subprotocol();
-}
-
-// [[Rcpp::export]]
 std::string wsState(SEXP client_xptr) {
   shared_ptr<WSConnection> wsPtr = xptrGetClient(client_xptr);
   switch(wsPtr->state) {
     case WSConnection::STATE::INIT: return "INIT";
     case WSConnection::STATE::OPEN: return "OPEN";
-    case WSConnection::STATE::CLOSING: return "CLOSING";
     case WSConnection::STATE::CLOSED: return "CLOSED";
     case WSConnection::STATE::FAILED: return "FAILED";
   }
